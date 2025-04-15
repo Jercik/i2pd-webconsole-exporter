@@ -568,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "i2pd-webconsole-exporter"
-version = "1.0.7"
+version = "1.0.8"
 dependencies = [
  "env_logger",
  "log",
