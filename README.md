@@ -70,6 +70,45 @@ The compiled binary can be found in the `./dist/` directory after running the `b
 
 Deployment instructions depend on your specific environment. You will typically need to:
 
-1. Copy the binary to your target server.
+1. Copy the binary to your target server (e.g., `/usr/local/bin/i2pd-webconsole-exporter`).
 2. Configure it to run as a service (e.g., using systemd).
 3. Provide the necessary environment variables for configuration (see Configuration section above).
+
+### Systemd Service Example
+
+Here is an example systemd service file (`/etc/systemd/system/i2pd-webconsole-exporter.service`). Adjust paths, user, group, and environment variables as needed.
+
+```ini
+[Unit]
+Description=I2Pd Web Metrics Exporter
+# Ensure i2pd is started before this service
+After=i2pd.service
+Requires=i2pd.service
+
+[Service]
+Type=simple
+# Optional: Add startup delay to ensure i2pd is fully initialized
+# ExecStartPre=/bin/sleep 3
+ExecStart=/usr/local/bin/i2pd-webconsole-exporter
+# Adjust these environment variables according to your i2pd setup
+Environment="I2PD_WEB_CONSOLE=http://127.0.0.1:7070"
+Environment="METRICS_LISTEN_ADDR=0.0.0.0:9447"
+Environment="RUST_LOG=info"
+# Improved restart policy with backoff
+Restart=on-failure
+RestartSec=10
+# Run as the i2pd user (or another dedicated user)
+User=i2pd
+Group=i2pd
+
+[Install]
+WantedBy=multi-user.target
+```
+
+After creating the file, enable and start the service:
+
+```bash
+sudo systemctl enable i2pd-webconsole-exporter.service
+sudo systemctl start i2pd-webconsole-exporter.service
+sudo systemctl status i2pd-webconsole-exporter.service
+```
