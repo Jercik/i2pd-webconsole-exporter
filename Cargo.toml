@@ -1,6 +1,6 @@
 [package]
 name = "i2pd-webconsole-exporter"
-version = "1.0.8"
+version = "1.0.9"
 edition = "2021"
 authors = ["The i2pd-webconsole-exporter Contributors"]
 description = "Prometheus exporter for i2pd (via Web Console scraping)" # Placeholder description
@@ -9,12 +9,13 @@ repository = "https://github.com/Jercik/i2pd-webconsole-exporter"
 keywords = ["i2p", "i2pd", "prometheus", "exporter", "monitoring"]
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 env_logger = "0.11"
 log = "0.4"
 warp = "0.3"
 regex = "1"
+once_cell = "1.18"
 
 [profile.release]
 opt-level = 'z'      # Optimize for size

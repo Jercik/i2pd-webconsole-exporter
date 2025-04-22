@@ -6,6 +6,26 @@ use log::{debug, error, info};
 use regex::Regex;
 use std::sync::Arc;
 use warp::Filter;
+use once_cell::sync::Lazy;
+use tokio::signal;
+
+// -------------------------------------------------------------------------
+// Pre‑compiled regular expressions – created once at startup
+// -------------------------------------------------------------------------
+static IPV4_STATUS_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<b>Network status:</b> ([^<]+)").unwrap());
+static IPV6_STATUS_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<b>Network status v6:</b> ([^<]+)").unwrap());
+static TUNNEL_CREATION_RATE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<b>Tunnel creation success rate:</b> (\d+)%").unwrap());
+static DATA_SIZE_RE:        Lazy<Regex> = Lazy::new(|| Regex::new(r"(\d+\.\d+|\d+)\s*([KMGT]iB|B)").unwrap());
+static DATA_RATE_RE:        Lazy<Regex> = Lazy::new(|| Regex::new(r"(\d+\.\d+|\d+)\s*([KMGT]iB/s|B/s)").unwrap());
+static RECEIVED_BYTES_RE:   Lazy<Regex> = Lazy::new(|| Regex::new(r"<b>Received:</b> ([^<]+)<br>").unwrap());
+static SENT_BYTES_RE:       Lazy<Regex> = Lazy::new(|| Regex::new(r"<b>Sent:</b> ([^<]+)<br>").unwrap());
+static TRANSIT_BYTES_RE:    Lazy<Regex> = Lazy::new(|| Regex::new(r"<b>Transit:</b> ([^<]+)<br>").unwrap());
+static ROUTER_CAPS_RE:      Lazy<Regex> = Lazy::new(|| Regex::new(r"<b>Router Caps:</b> ([A-Za-z0-9~]+)<br>").unwrap());
+static EXT_ADDR_ROW_RE:     Lazy<Regex> = Lazy::new(|| Regex::new(r"<tr>\s*<td>([^<]+)</td>\s*<td>([^<]+)</td>\s*</tr>").unwrap());
+static NET_COUNTS_RE:       Lazy<Regex> = Lazy::new(|| Regex::new(r"<b>Routers:</b> (\d+) <b>Floodfills:</b> (\d+) <b>LeaseSets:</b> (\d+)").unwrap());
+static TUNNEL_COUNTS_RE:    Lazy<Regex> = Lazy::new(|| Regex::new(r"<b>Client Tunnels:</b> (\d+) <b>Transit Tunnels:</b> (\d+)").unwrap());
+static SERVICE_ROW_RE:      Lazy<Regex> = Lazy::new(|| Regex::new(r"<tr><td>([^<]+)</td><td class='(enabled|disabled)'>([^<]+)</td></tr>").unwrap());
+// -------------------------------------------------------------------------
 
 // Struct to hold parsed data metrics
 #[derive(Debug, Default)]
@@ -37,115 +57,66 @@ impl AppState {
 
     // Parse network status for IPv4 and IPv6
     fn parse_network_status(&self, html: &str) -> (Option<String>, Option<String>) {
-        let ipv4_re = match Regex::new(r"<b>Network status:</b> ([^<]+)") {
-            Ok(re) => re,
-            Err(_) => return (None, None),
-        };
-        
-        let ipv6_re = match Regex::new(r"<b>Network status v6:</b> ([^<]+)") {
-            Ok(re) => re,
-            Err(_) => return (None, None),
-        };
-        
-        let ipv4_status = ipv4_re
+        let v4 = IPV4_STATUS_RE
             .captures(html)
-            .and_then(|caps| caps.get(1).map(|m| m.as_str().trim().to_string()));
-            
-        let ipv6_status = ipv6_re
+            .and_then(|c| c.get(1).map(|m| m.as_str().trim().to_string()));
+        let v6 = IPV6_STATUS_RE
             .captures(html)
-            .and_then(|caps| caps.get(1).map(|m| m.as_str().trim().to_string()));
-        
-        (ipv4_status, ipv6_status)
+            .and_then(|c| c.get(1).map(|m| m.as_str().trim().to_string()));
+        (v4, v6)
     }
 
     // Parse tunnel creation success rate
     fn parse_tunnel_creation_rate(&self, html: &str) -> Option<f64> {
-        let re = match Regex::new(r"<b>Tunnel creation success rate:</b> (\d+)%") {
-            Ok(re) => re,
-            Err(_) => return None,
-        };
-        re.captures(html).and_then(|caps| {
-            caps.get(1).and_then(|m| m.as_str().parse::<f64>().ok())
-        })
+        TUNNEL_CREATION_RATE_RE
+            .captures(html)
+            .and_then(|c| c.get(1)?.as_str().parse::<f64>().ok())
     }
 
     // Parses data sizes like "1.23 GiB" or "500 MiB" into bytes (u64).
-    fn parse_data_size(&self, size_str: &str) -> Option<u64> {
-        let re = match Regex::new(r"(\d+\.\d+|\d+)\s*([KMGT]iB|B)") {
-            Ok(re) => re,
-            Err(_) => return None, // Return None if regex compilation fails
-        };
-        
-        let caps = re.captures(size_str)?;
-        let value_str = caps.get(1)?.as_str();
-        let value: f64 = value_str.parse().ok()?;
-        let unit = caps.get(2)?.as_str();
-        
-        let multiplier: u64 = match unit {
+    fn parse_data_size(&self, s: &str) -> Option<u64> {
+        let caps = DATA_SIZE_RE.captures(s)?;
+        let value: f64 = caps[1].parse().ok()?;
+        let mult = match &caps[2] {
             "B" => 1,
             "KiB" => 1024,
             "MiB" => 1024 * 1024,
             "GiB" => 1024 * 1024 * 1024,
-            "TiB" => 1024_u64 * 1024_u64 * 1024_u64 * 1024_u64,
-            _ => return None, // Unknown unit
+            "TiB" => 1024_u64.pow(4),
+            _ => return None,
         };
-        
-        Some((value * multiplier as f64) as u64)
+        Some((value * mult as f64) as u64)
     }
 
     // Parses data rates like "100.5 KiB/s" into bytes/second (f64).
     fn parse_data_rate(&self, rate_str: &str) -> Option<f64> {
-        let re = match Regex::new(r"(\d+\.\d+|\d+)\s*([KMGT]iB/s|B/s)") {
-            Ok(re) => re,
-            Err(_) => return None, // Return None if regex compilation fails
-        };
-        
-        let caps = re.captures(rate_str)?;
-        let value_str = caps.get(1)?.as_str();
-        let value: f64 = value_str.parse().ok()?;
-        let unit = caps.get(2)?.as_str();
-        
-        let multiplier = match unit {
+        let caps = DATA_RATE_RE.captures(rate_str)?;
+        let value: f64 = caps[1].parse().ok()?;
+        let mult = match &caps[2] {
             "B/s" => 1.0,
             "KiB/s" => 1024.0,
             "MiB/s" => 1024.0 * 1024.0,
             "GiB/s" => 1024.0 * 1024.0 * 1024.0,
-            "TiB/s" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-            _ => return None, // Unknown unit
+            "TiB/s" => 1024.0_f64.powi(4), // Use powi for integer exponent
+            _ => return None,
         };
-        
-        Some(value * multiplier)
+        Some(value * mult)
     }
 
     // Parse received, sent and transit data
     fn parse_data_metrics(&self, html: &str) -> DataMetrics {
         let mut metrics = DataMetrics::default();
 
-        let received_bytes_re = match Regex::new(r"<b>Received:</b> ([^<]+)<br>") {
-            Ok(re) => re,
-            Err(_) => return metrics, // Return default on regex error
-        };
-        
-        let sent_bytes_re = match Regex::new(r"<b>Sent:</b> ([^<]+)<br>") {
-            Ok(re) => re,
-            Err(_) => return metrics, // Return default on regex error
-        };
-        
-        let transit_bytes_re = match Regex::new(r"<b>Transit:</b> ([^<]+)<br>") {
-            Ok(re) => re,
-            Err(_) => return metrics, // Return default on regex error
-        };
-        
-        let received_str = received_bytes_re
+        let received_str = RECEIVED_BYTES_RE
             .captures(html)
             .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()));
-        let sent_str = sent_bytes_re
+        let sent_str = SENT_BYTES_RE
             .captures(html)
             .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()));
-        let transit_str = transit_bytes_re
+        let transit_str = TRANSIT_BYTES_RE
             .captures(html)
             .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()));
-        
+
         let (received_bytes, received_rate) = if let Some(s) = received_str {
             let parts: Vec<&str> = s.split(" (").collect();
             let total = if !parts.is_empty() { self.parse_data_size(parts[0]) } else { None };
@@ -159,7 +130,7 @@ impl AppState {
         } else {
             (None, None)
         };
-        
+
         let (sent_bytes, sent_rate) = if let Some(s) = sent_str {
             let parts: Vec<&str> = s.split(" (").collect();
             let total = if !parts.is_empty() { self.parse_data_size(parts[0]) } else { None };
@@ -173,7 +144,7 @@ impl AppState {
         } else {
             (None, None)
         };
-        
+
         let (transit_bytes, transit_rate) = if let Some(s) = transit_str {
             let parts: Vec<&str> = s.split(" (").collect();
             let total = if !parts.is_empty() { self.parse_data_size(parts[0]) } else { None };
@@ -200,32 +171,21 @@ impl AppState {
 
     // Parse router capabilities
     fn parse_router_capabilities(&self, html: &str) -> Option<String> {
-        let re = match Regex::new(r"<b>Router Caps:</b> ([A-Za-z0-9~]+)<br>") {
-            Ok(re) => re,
-            Err(_) => return None,
-        };
-        
-        re.captures(html)
+        ROUTER_CAPS_RE
+            .captures(html)
             .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
     }
 
     // Parse external addresses
     fn parse_external_addresses(&self, html: &str) -> Vec<(String, String)> {
         let mut addresses = Vec::new();
-        
+
         if let Some(start_idx) = html.find("<b>Our external address:</b>") {
             if let Some(table_start) = html[start_idx..].find("<table class=\"extaddr\">") {
                 if let Some(table_end) = html[start_idx + table_start..].find("</table>") {
                     let table_html = &html[start_idx + table_start..(start_idx + table_start + table_end + 8)];
-                    
-                    let row_re = match Regex::new(
-                        r"<tr>\s*<td>([^<]+)</td>\s*<td>([^<]+)</td>\s*</tr>"
-                    ) {
-                        Ok(re) => re,
-                        Err(_) => return addresses,
-                    };
-                    
-                    for cap in row_re.captures_iter(table_html) {
+
+                    for cap in EXT_ADDR_ROW_RE.captures_iter(table_html) {
                         if let (Some(protocol), Some(address)) = (cap.get(1), cap.get(2)) {
                             addresses.push((
                                 protocol.as_str().to_string(),
@@ -236,20 +196,13 @@ impl AppState {
                 }
             }
         }
-        
+
         addresses
     }
 
     // Parse network counts (routers, floodfills, leasesets)
     fn parse_network_counts(&self, html: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
-        let re = match Regex::new(
-            r"<b>Routers:</b> (\d+) <b>Floodfills:</b> (\d+) <b>LeaseSets:</b> (\d+)"
-        ) {
-            Ok(re) => re,
-            Err(_) => return (None, None, None),
-        };
-        
-        if let Some(caps) = re.captures(html) {
+        if let Some(caps) = NET_COUNTS_RE.captures(html) {
             let routers = caps.get(1).and_then(|m| m.as_str().parse::<u64>().ok());
             let floodfills = caps.get(2).and_then(|m| m.as_str().parse::<u64>().ok());
             let leasesets = caps.get(3).and_then(|m| m.as_str().parse::<u64>().ok());
@@ -260,12 +213,7 @@ impl AppState {
 
     // Parse tunnel counts (client and transit)
     fn parse_tunnel_counts(&self, html: &str) -> (Option<u64>, Option<u64>) {
-        let re = match Regex::new(r"<b>Client Tunnels:</b> (\d+) <b>Transit Tunnels:</b> (\d+)") {
-            Ok(re) => re,
-            Err(_) => return (None, None),
-        };
-        
-        if let Some(caps) = re.captures(html) {
+        if let Some(caps) = TUNNEL_COUNTS_RE.captures(html) {
             let client = caps.get(1).and_then(|m| m.as_str().parse::<u64>().ok());
             let transit = caps.get(2).and_then(|m| m.as_str().parse::<u64>().ok());
             return (client, transit);
@@ -276,19 +224,12 @@ impl AppState {
     // Parse service statuses
     fn parse_service_statuses(&self, html: &str) -> HashMap<String, bool> {
         let mut services = HashMap::new();
-        
+
         if let Some(table_start) = html.find("<table class=\"services\">") {
             if let Some(table_end) = html[table_start..].find("</table>") {
                 let table_html = &html[table_start..(table_start + table_end + 8)];
-                
-                let row_re = match Regex::new(
-                    r"<tr><td>([^<]+)</td><td class='(enabled|disabled)'>([^<]+)</td></tr>"
-                ) {
-                    Ok(re) => re,
-                    Err(_) => return services,
-                };
-                
-                for cap in row_re.captures_iter(table_html) {
+
+                for cap in SERVICE_ROW_RE.captures_iter(table_html) {
                     if let (Some(service), Some(status_class)) = (cap.get(1), cap.get(2)) {
                         let is_enabled = status_class.as_str() == "enabled";
                         let service_name = service.as_str().to_lowercase().replace(" ", "_");
@@ -297,7 +238,7 @@ impl AppState {
                 }
             }
         }
-        
+
         services
     }
 
@@ -535,7 +476,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let routes = route_metrics.or(route_404);
 
     info!("Listening on http://{}", listen_addr);
-    warp::serve(routes).run(listen_addr).await;
+
+    let server = warp::serve(routes).bind_with_graceful_shutdown(listen_addr, async {
+        if let Err(e) = signal::ctrl_c().await {
+            error!("Failed to listen for shutdown signal: {}", e);
+        }
+        info!("Shutdown signal received, shutting down...");
+    });
+
+    // The bind_with_graceful_shutdown function returns a tuple (SocketAddr, Future)
+    // We only need to await the future part (the second element).
+    let (_addr, future) = server;
+    future.await;
 
     Ok(())
 }
