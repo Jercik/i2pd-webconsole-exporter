@@ -2,12 +2,19 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use clap::Parser; // Added for CLI argument parsing
 use log::{debug, error, info};
 use regex::Regex;
 use std::sync::Arc;
 use warp::Filter;
 use once_cell::sync::Lazy;
 use tokio::signal;
+
+// --- CLI Arguments ---
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)] // Automatically uses version from Cargo.toml
+struct Cli {}
 
 // -------------------------------------------------------------------------
 // Pre‑compiled regular expressions – created once at startup
@@ -417,6 +424,9 @@ impl AppState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Parse command-line arguments (handles --version automatically)
+    let _cli = Cli::parse();
+
     env_logger::init();
 
     // Configuration from environment variables
