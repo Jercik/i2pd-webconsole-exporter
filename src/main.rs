@@ -4,11 +4,11 @@ use std::time::Duration;
 
 use clap::Parser; // Added for CLI argument parsing
 use log::{debug, error, info};
+use once_cell::sync::Lazy;
 use regex::Regex;
 use std::sync::Arc;
-use warp::Filter;
-use once_cell::sync::Lazy;
 use tokio::signal;
+use warp::Filter;
 
 // --- CLI Arguments ---
 
@@ -19,19 +19,34 @@ struct Cli {}
 // -------------------------------------------------------------------------
 // Pre‑compiled regular expressions – created once at startup
 // -------------------------------------------------------------------------
-static IPV4_STATUS_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<b>Network status:</b> ([^<]+)").unwrap());
-static IPV6_STATUS_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<b>Network status v6:</b> ([^<]+)").unwrap());
-static TUNNEL_CREATION_RATE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<b>Tunnel creation success rate:</b> (\d+)%").unwrap());
-static DATA_SIZE_RE:        Lazy<Regex> = Lazy::new(|| Regex::new(r"(\d+\.\d+|\d+)\s*([KMGT]iB|B)").unwrap());
-static DATA_RATE_RE:        Lazy<Regex> = Lazy::new(|| Regex::new(r"(\d+\.\d+|\d+)\s*([KMGT]iB/s|B/s)").unwrap());
-static RECEIVED_BYTES_RE:   Lazy<Regex> = Lazy::new(|| Regex::new(r"<b>Received:</b> ([^<]+)<br>").unwrap());
-static SENT_BYTES_RE:       Lazy<Regex> = Lazy::new(|| Regex::new(r"<b>Sent:</b> ([^<]+)<br>").unwrap());
-static TRANSIT_BYTES_RE:    Lazy<Regex> = Lazy::new(|| Regex::new(r"<b>Transit:</b> ([^<]+)<br>").unwrap());
-static ROUTER_CAPS_RE:      Lazy<Regex> = Lazy::new(|| Regex::new(r"<b>Router Caps:</b> ([A-Za-z0-9~]+)<br>").unwrap());
-static EXT_ADDR_ROW_RE:     Lazy<Regex> = Lazy::new(|| Regex::new(r"<tr>\s*<td>([^<]+)</td>\s*<td>([^<]+)</td>\s*</tr>").unwrap());
-static NET_COUNTS_RE:       Lazy<Regex> = Lazy::new(|| Regex::new(r"<b>Routers:</b> (\d+) <b>Floodfills:</b> (\d+) <b>LeaseSets:</b> (\d+)").unwrap());
-static TUNNEL_COUNTS_RE:    Lazy<Regex> = Lazy::new(|| Regex::new(r"<b>Client Tunnels:</b> (\d+) <b>Transit Tunnels:</b> (\d+)").unwrap());
-static SERVICE_ROW_RE:      Lazy<Regex> = Lazy::new(|| Regex::new(r"<tr><td>([^<]+)</td><td class='(enabled|disabled)'>([^<]+)</td></tr>").unwrap());
+static IPV4_STATUS_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"<b>Network status:</b> ([^<]+)").unwrap());
+static IPV6_STATUS_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"<b>Network status v6:</b> ([^<]+)").unwrap());
+static TUNNEL_CREATION_RATE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"<b>Tunnel creation success rate:</b> (\d+)%").unwrap());
+static DATA_SIZE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(\d+\.\d+|\d+)\s*([KMGT]iB|B)").unwrap());
+static DATA_RATE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(\d+\.\d+|\d+)\s*([KMGT]iB/s|B/s)").unwrap());
+static RECEIVED_BYTES_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"<b>Received:</b> ([^<]+)<br>").unwrap());
+static SENT_BYTES_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<b>Sent:</b> ([^<]+)<br>").unwrap());
+static TRANSIT_BYTES_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"<b>Transit:</b> ([^<]+)<br>").unwrap());
+static ROUTER_CAPS_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"<b>Router Caps:</b> ([A-Za-z0-9~]+)<br>").unwrap());
+static EXT_ADDR_ROW_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"<tr>\s*<td>([^<]+)</td>\s*<td>([^<]+)</td>\s*</tr>").unwrap());
+static NET_COUNTS_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"<b>Routers:</b> (\d+) <b>Floodfills:</b> (\d+) <b>LeaseSets:</b> (\d+)").unwrap()
+});
+static TUNNEL_COUNTS_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"<b>Client Tunnels:</b> (\d+) <b>Transit Tunnels:</b> (\d+)").unwrap()
+});
+static SERVICE_ROW_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"<tr><td>([^<]+)</td><td class='(enabled|disabled)'>([^<]+)</td></tr>").unwrap()
+});
 // -------------------------------------------------------------------------
 
 // Struct to hold parsed data metrics
@@ -126,7 +141,11 @@ impl AppState {
 
         let (received_bytes, received_rate) = if let Some(s) = received_str {
             let parts: Vec<&str> = s.split(" (").collect();
-            let total = if !parts.is_empty() { self.parse_data_size(parts[0]) } else { None };
+            let total = if !parts.is_empty() {
+                self.parse_data_size(parts[0])
+            } else {
+                None
+            };
             let rate = if parts.len() > 1 {
                 let rate_part = parts[1].trim_end_matches(')');
                 self.parse_data_rate(rate_part)
@@ -140,7 +159,11 @@ impl AppState {
 
         let (sent_bytes, sent_rate) = if let Some(s) = sent_str {
             let parts: Vec<&str> = s.split(" (").collect();
-            let total = if !parts.is_empty() { self.parse_data_size(parts[0]) } else { None };
+            let total = if !parts.is_empty() {
+                self.parse_data_size(parts[0])
+            } else {
+                None
+            };
             let rate = if parts.len() > 1 {
                 let rate_part = parts[1].trim_end_matches(')');
                 self.parse_data_rate(rate_part)
@@ -154,7 +177,11 @@ impl AppState {
 
         let (transit_bytes, transit_rate) = if let Some(s) = transit_str {
             let parts: Vec<&str> = s.split(" (").collect();
-            let total = if !parts.is_empty() { self.parse_data_size(parts[0]) } else { None };
+            let total = if !parts.is_empty() {
+                self.parse_data_size(parts[0])
+            } else {
+                None
+            };
             let rate = if parts.len() > 1 {
                 let rate_part = parts[1].trim_end_matches(')');
                 self.parse_data_rate(rate_part)
@@ -190,7 +217,8 @@ impl AppState {
         if let Some(start_idx) = html.find("<b>Our external address:</b>") {
             if let Some(table_start) = html[start_idx..].find("<table class=\"extaddr\">") {
                 if let Some(table_end) = html[start_idx + table_start..].find("</table>") {
-                    let table_html = &html[start_idx + table_start..(start_idx + table_start + table_end + 8)];
+                    let table_html =
+                        &html[start_idx + table_start..(start_idx + table_start + table_end + 8)];
 
                     for cap in EXT_ADDR_ROW_RE.captures_iter(table_html) {
                         if let (Some(protocol), Some(address)) = (cap.get(1), cap.get(2)) {
@@ -256,7 +284,7 @@ impl AppState {
         // Fetch the HTML content from the configured URL
         let uri = &self.web_console_url;
         debug!("Fetching web console from: {}", uri);
-        
+
         let response = self
             .web_client
             .get(uri)
@@ -272,35 +300,41 @@ impl AppState {
             .text()
             .await
             .map_err(|e| format!("Failed to read response body: {}", e))?;
-        
+
         // Build metrics output
         let mut output = String::with_capacity(2048);
-        
+
         // Parse network status
         let (ipv4_status, ipv6_status) = self.parse_network_status(&html);
         if let Some(status) = ipv4_status {
             output += "# HELP i2p_network_status_v4 IPv4 network status as string\n";
             output += "# TYPE i2p_network_status_v4 gauge\n";
             let status_value = if status == "OK" { 1 } else { 0 };
-            output += &format!("i2p_network_status_v4{{status=\"{}\"}} {}\n", status, status_value);
+            output += &format!(
+                "i2p_network_status_v4{{status=\"{}\"}} {}\n",
+                status, status_value
+            );
         }
         if let Some(status) = ipv6_status {
             output += "# HELP i2p_network_status_v6 IPv6 network status as string\n";
             output += "# TYPE i2p_network_status_v6 gauge\n";
             let status_value = if status == "OK" { 1 } else { 0 };
-            output += &format!("i2p_network_status_v6{{status=\"{}\"}} {}\n", status, status_value);
+            output += &format!(
+                "i2p_network_status_v6{{status=\"{}\"}} {}\n",
+                status, status_value
+            );
         }
-        
+
         // Parse tunnel creation success rate
         if let Some(rate) = self.parse_tunnel_creation_rate(&html) {
             output += "# HELP i2p_tunnel_creation_success_rate Percentage of successful tunnel creations\n";
             output += "# TYPE i2p_tunnel_creation_success_rate gauge\n";
             output += &format!("i2p_tunnel_creation_success_rate {}\n", rate);
         }
-        
+
         // Parse data metrics (received, sent, transit)
         let data_metrics = self.parse_data_metrics(&html);
-        
+
         if let Some(bytes) = data_metrics.received_bytes {
             output += "# HELP i2p_data_received_bytes Total data received in bytes\n";
             output += "# TYPE i2p_data_received_bytes counter\n";
@@ -316,12 +350,15 @@ impl AppState {
             output += "# TYPE i2p_data_transit_bytes counter\n";
             output += &format!("i2p_data_transit_bytes {}\n", bytes);
         }
-        
+
         // Add data rate metrics
-        if data_metrics.received_rate.is_some() || data_metrics.sent_rate.is_some() || data_metrics.transit_rate.is_some() {
+        if data_metrics.received_rate.is_some()
+            || data_metrics.sent_rate.is_some()
+            || data_metrics.transit_rate.is_some()
+        {
             output += "# HELP i2p_data_rate_bytes_per_second Data transfer rate in bytes/second\n";
             output += "# TYPE i2p_data_rate_bytes_per_second gauge\n";
-            
+
             if let Some(rate) = data_metrics.received_rate {
                 output += &format!(
                     "i2p_data_rate_bytes_per_second{{direction=\"received\"}} {}\n",
@@ -341,14 +378,14 @@ impl AppState {
                 );
             }
         }
-        
+
         // Parse router capabilities
         if let Some(caps) = self.parse_router_capabilities(&html) {
             output += "# HELP i2p_router_capabilities Router capabilities\n";
             output += "# TYPE i2p_router_capabilities gauge\n";
             output += &format!("i2p_router_capabilities{{capabilities=\"{}\"}} 1\n", caps);
         }
-        
+
         // Parse external addresses
         let addresses = self.parse_external_addresses(&html);
         if !addresses.is_empty() {
@@ -361,7 +398,7 @@ impl AppState {
                 );
             }
         }
-        
+
         // Parse network counts
         let network_counts = self.parse_network_counts(&html);
         if let Some(count) = network_counts.0 {
@@ -379,12 +416,12 @@ impl AppState {
             output += "# TYPE i2p_network_leasesets gauge\n";
             output += &format!("i2p_network_leasesets {}\n", count);
         }
-        
+
         // Parse tunnel counts
         let tunnel_counts = self.parse_tunnel_counts(&html);
         let client_tunnels = tunnel_counts.0;
         let transit_tunnels = tunnel_counts.1;
-        
+
         if let Some(count) = client_tunnels {
             output += "# HELP i2p_client_tunnels Count of client tunnels\n";
             output += "# TYPE i2p_client_tunnels gauge\n";
@@ -395,7 +432,7 @@ impl AppState {
             output += "# TYPE i2p_transit_tunnels gauge\n";
             output += &format!("i2p_transit_tunnels {}\n", count);
         }
-        
+
         // Parse service statuses
         let services = self.parse_service_statuses(&html);
         if !services.is_empty() {
@@ -409,15 +446,16 @@ impl AppState {
                 );
             }
         }
-        
+
         // Add exporter version info
-        output += "# HELP i2pd_webconsole_exporter_version_info I2P webconsole exporter version info\n";
+        output +=
+            "# HELP i2pd_webconsole_exporter_version_info I2P webconsole exporter version info\n";
         output += "# TYPE i2pd_webconsole_exporter_version_info gauge\n";
         output += &format!(
             "i2pd_webconsole_exporter_version_info{{version=\"{}\"}} 1\n",
             env!("CARGO_PKG_VERSION")
         );
-        
+
         Ok(output)
     }
 }
@@ -430,10 +468,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     // Configuration from environment variables
-    let web_console_url = std::env::var("I2PD_WEB_CONSOLE")
-        .unwrap_or_else(|_| "http://127.0.0.1:7070".to_string());
-    let listen_addr = std::env::var("METRICS_LISTEN_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:9700".to_string());
+    let web_console_url =
+        std::env::var("I2PD_WEB_CONSOLE").unwrap_or_else(|_| "http://127.0.0.1:7070".to_string());
+    let listen_addr =
+        std::env::var("METRICS_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:9700".to_string());
     let http_timeout = std::env::var("HTTP_TIMEOUT_SECONDS")
         .unwrap_or_else(|_| "60".to_string())
         .parse::<u64>()
@@ -458,15 +496,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match st.fetch_metrics().await {
             Ok(metrics) => {
                 let reply = warp::reply::with_status(metrics, warp::http::StatusCode::OK);
-                let reply = warp::reply::with_header(reply, "Content-Type", "text/plain; version=0.0.4");
+                let reply =
+                    warp::reply::with_header(reply, "Content-Type", "text/plain; version=0.0.4");
                 Ok(reply)
             }
             Err(err) => {
                 error!("Failed to fetch metrics: {}", err);
                 let error_body = "Error retrieving metrics".to_string();
+                let reply = warp::reply::with_status(
+                    error_body,
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                );
                 let reply =
-                    warp::reply::with_status(error_body, warp::http::StatusCode::INTERNAL_SERVER_ERROR);
-                let reply = warp::reply::with_header(reply, "Content-Type", "text/plain; version=0.0.4");
+                    warp::reply::with_header(reply, "Content-Type", "text/plain; version=0.0.4");
                 Ok(reply)
             }
         }
@@ -478,9 +520,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(metrics_handler);
 
     // Fallback 404 for anything else
-    let route_404 = warp::any().map(|| {
-        warp::reply::with_status("Not Found", warp::http::StatusCode::NOT_FOUND)
-    });
+    let route_404 = warp::any()
+        .map(|| warp::reply::with_status("Not Found", warp::http::StatusCode::NOT_FOUND));
 
     // Combine
     let routes = route_metrics.or(route_404);
