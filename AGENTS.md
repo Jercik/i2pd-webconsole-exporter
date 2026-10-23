@@ -97,7 +97,7 @@ Volume=/var/lib/myapp:/data:rw
 
 Kubernetes sets the UID and GID through the pod-level `securityContext` (`runAsUser`, `runAsGroup`). `runAsNonRoot` only makes the kubelet refuse a container whose UID is zero or cannot be verified as non-zero (a named `USER` without `runAsUser`, which is why the fallback `USER` is numeric). `fsGroup` adds a supplementary group to every process and, on volume types that support it (not `hostPath`), sets that group and setgid on the volume; it leaves image paths alone. docker-compose uses `user: "1100:1100"`.
 
-On the host, create the user and group with the same deterministic UID/GID the orchestrator specifies (`ansible.builtin.user`/`group` with explicit `uid:`/`gid:`), and for rootful Podman give bind-mounted data directories that owner. Rootless Podman maps host IDs through a user namespace, so under the default mapping use a named volume or `podman unshare chown` instead. Under `UserNS=keep-id` the process runs as the host user unless the image's `USER` or `User=` names another UID. When it is the host user, leave the bind-mounted host directory owned by that user, because `podman unshare chown` would take it away. For another UID, map the host user to that UID and GID with `UserNS=keep-id:uid=<UID>,gid=<GID>`; `podman unshare chown` uses a different mapping below the host UID and picks the wrong host ID (verified on Podman 5.4).
+On the host, create the user and group with the same deterministic UID/GID the orchestrator specifies (`ansible.builtin.user`/`group` with explicit `uid:`/`gid:`). Rootless Podman maps host IDs through a user namespace, so under the default mapping chown a bind-mounted directory to the container's UID and GID with `podman unshare chown <UID>:<GID> <dir>`, or use a named volume. Under `UserNS=keep-id` the process runs as the host user unless the image's `USER` or `User=` names another UID. When it is the host user, leave the bind-mounted host directory owned by that user, because `podman unshare chown` would take it away. For another UID, map the host user to that UID and GID with `UserNS=keep-id:uid=<UID>,gid=<GID>`; `podman unshare chown` uses a different mapping below the host UID and picks the wrong host ID (Podman 5.4).
 
 # Rule: Avoid Leaky Abstractions
 
@@ -159,6 +159,8 @@ A module earns its place by what it hides behind an interface smaller than the i
 - If understanding a caller requires repeatedly reading a callee's body, that boundary hides nothing: inline it or redesign the interface.
 - A wrapper that only forwards calls adds surface without hiding anything; use the wrapped thing directly. An interface that hides infrastructure behind domain-shaped methods is the opposite case — that is depth.
 - In production code, one general operation serving all current callers beats several near-duplicate special-case ones.
+
+When a change adds or reshapes an interface — a new type, module, service, option, or error path — or splits, merges, wraps, or layers code, load the `module-design-tradeoffs` skill before settling the design.
 
 # Rule: Design Contracts Twice
 
@@ -261,7 +263,7 @@ function handleRequest(body: unknown): User {
 
 # Rule: Test What Matters
 
-Write tests where failure is expensive and the test can stay stable: business rules, data transformations, the functional core's public contracts, and a regression test for every bug you fix, shell code included, unless the compiler would reject the bug if it came back. Beyond those regression tests, leave the imperative shell — CLI entry points, HTTP handlers, database and file I/O — untested unless tests are requested; when they are, prefer a thin set of end-to-end flows over unit tests with mocks. Write fewer for pass-through forwarding, private helpers already covered through a public caller, call-count and call-order choreography, wholesale snapshots, and any test whose assertions mirror the implementation instead of the promised behavior.
+Write tests where failure is expensive and the test can stay stable: business rules, data transformations, the functional core's public contracts, and a regression test for every bug you fix, shell code included, unless the compiler would reject the bug if it came back. Beyond those regression tests, leave the imperative shell defined in “Separate the Functional Core from the Imperative Shell” untested unless tests are requested; when they are, prefer a thin set of end-to-end flows over unit tests with mocks. Write fewer for pass-through forwarding, private helpers already covered through a public caller, call-count and call-order choreography, wholesale snapshots, and any test whose assertions mirror the implementation instead of the promised behavior.
 
 ```ts
 // BAD: asserts internal choreography, not the promised behavior
@@ -289,7 +291,9 @@ Forks of upstream projects and vendored third-party code keep upstream's convent
 
 # Rule: Use `repoq` for Repository Queries
 
-Use `repoq` for reading repository state instead of piping `git` or the forge CLI through `awk`/`jq`/`grep`. Each command handles edge cases (detached HEAD, unborn branches, missing auth) and, under `--json`, returns validated JSON. It also carries one write verb: `pr create` opens a pull request on the detected forge, taking the body from a file or stdin rather than an argument the shell would expand. Use raw `git` for commit/push/merge, and the repo's forge CLI for the other forge-side mutations (issues, releases, PR edits) — `gh` for GitHub or `fgj` for Forgejo, per the detected provider. Run `npx -y repoq@latest --help` if unsure of the available subcommands; the explicit tag prevents `npx` from reusing a stale cached release.
+Use `repoq` for reading repository state instead of piping `git` or the forge CLI through `awk`/`jq`/`grep`. Each command handles edge cases (detached HEAD, unborn branches, missing auth) and, under `--json`, returns validated JSON. It also carries one write verb: `pr create` opens a pull request on the detected forge, taking the body from a file or stdin rather than an argument the shell would expand. Use raw `git` for commit/push/merge, and the repo's forge CLI for the other forge-side mutations (issues, releases, PR edits) — `gh` for GitHub or `fgj` for Forgejo, per the detected provider.
+
+Run it as `npx -y --@j4k-oss:registry=https://code.j4k.dev/api/packages/j4k-oss/npm/ @j4k-oss/repoq@latest <command>`, and add `--help` if unsure of the available subcommands. It publishes only to the Forge registry as `@j4k-oss/repoq`; the unscoped `repoq` on npmjs is deprecated and frozen at an old release. Keep the `--@j4k-oss:registry` flag: without it, `npx` looks on npmjs, finds nothing, and fails with a 404. The `@latest` tag prevents `npx` from reusing a stale cached release.
 
 # Rule: Upgrade Dependencies with `cargo update`
 
