@@ -26,12 +26,6 @@ jobs:
           # The validation step executes the PR's helper; do not persist its token.
           persist-credentials: false
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          # Policy-pinned runtime for the refreshed PR metadata parser.
-          node-version: "26.12.1"
-
       - name: Read the current pull request
         # Reruns can replay stale metadata, so read the current pull request;
         # validation still uses this run's event head.
