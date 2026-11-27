@@ -1,50 +1,57 @@
+mod cli;
+
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::pin;
+use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::Parser; // Added for CLI argument parsing
+use http_body_util::Full;
+use hyper::body::{Bytes, Incoming};
+use hyper::header::{HeaderValue, CONTENT_TYPE};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use hyper_util::server::graceful::GracefulShutdown;
 use log::{debug, error, info};
-use once_cell::sync::Lazy;
 use regex::Regex;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use tokio::net::TcpListener;
 use tokio::signal;
-use warp::Filter;
-
-// --- CLI Arguments ---
-
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)] // Automatically uses version from Cargo.toml
-struct Cli {}
 
 // -------------------------------------------------------------------------
 // Pre‑compiled regular expressions – created once at startup
 // -------------------------------------------------------------------------
-static IPV4_STATUS_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"<b>Network status:</b> ([^<]+)").unwrap());
-static IPV6_STATUS_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"<b>Network status v6:</b> ([^<]+)").unwrap());
-static TUNNEL_CREATION_RATE_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"<b>Tunnel creation success rate:</b> (\d+)%").unwrap());
-static DATA_SIZE_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(\d+\.\d+|\d+)\s*([KMGT]iB|B)").unwrap());
-static DATA_RATE_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(\d+\.\d+|\d+)\s*([KMGT]iB/s|B/s)").unwrap());
-static RECEIVED_BYTES_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"<b>Received:</b> ([^<]+)<br>").unwrap());
-static SENT_BYTES_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<b>Sent:</b> ([^<]+)<br>").unwrap());
-static TRANSIT_BYTES_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"<b>Transit:</b> ([^<]+)<br>").unwrap());
-static ROUTER_CAPS_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"<b>Router Caps:</b> ([A-Za-z0-9~]+)<br>").unwrap());
-static EXT_ADDR_ROW_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"<tr>\s*<td>([^<]+)</td>\s*<td>([^<]+)</td>\s*</tr>").unwrap());
-static NET_COUNTS_RE: Lazy<Regex> = Lazy::new(|| {
+static IPV4_STATUS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<b>Network status:</b> ([^<]+)").unwrap());
+static IPV6_STATUS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<b>Network status v6:</b> ([^<]+)").unwrap());
+static TUNNEL_CREATION_RATE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<b>Tunnel creation success rate:</b> (\d+)%").unwrap());
+static DATA_SIZE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(\d+\.\d+|\d+)\s*([KMGT]iB|B)").unwrap());
+static DATA_RATE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(\d+\.\d+|\d+)\s*([KMGT]iB/s|B/s)").unwrap());
+static RECEIVED_BYTES_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<b>Received:</b> ([^<]+)<br>").unwrap());
+static SENT_BYTES_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<b>Sent:</b> ([^<]+)<br>").unwrap());
+static TRANSIT_BYTES_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<b>Transit:</b> ([^<]+)<br>").unwrap());
+static ROUTER_CAPS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<b>Router Caps:</b> ([A-Za-z0-9~]+)<br>").unwrap());
+static EXT_ADDR_ROW_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<tr>\s*<td>([^<]+)</td>\s*<td>([^<]+)</td>\s*</tr>").unwrap());
+static NET_COUNTS_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"<b>Routers:</b> (\d+) <b>Floodfills:</b> (\d+) <b>LeaseSets:</b> (\d+)").unwrap()
 });
-static TUNNEL_COUNTS_RE: Lazy<Regex> = Lazy::new(|| {
+static TUNNEL_COUNTS_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"<b>Client Tunnels:</b> (\d+) <b>Transit Tunnels:</b> (\d+)").unwrap()
 });
-static SERVICE_ROW_RE: Lazy<Regex> = Lazy::new(|| {
+static SERVICE_ROW_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"<tr><td>([^<]+)</td><td class='(enabled|disabled)'>([^<]+)</td></tr>").unwrap()
 });
 // -------------------------------------------------------------------------
@@ -460,13 +467,99 @@ impl AppState {
     }
 }
 
+const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4";
+
+fn is_metrics_path(path: &str) -> bool {
+    path.strip_prefix("/metrics")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+fn text_response(status: StatusCode, content_type: &str, body: String) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::from(body)));
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_str(content_type).unwrap());
+    response
+}
+
+async fn handle_request(
+    req: Request<Incoming>,
+    state: Arc<AppState>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    if !is_metrics_path(req.uri().path()) {
+        return Ok(text_response(
+            StatusCode::NOT_FOUND,
+            "text/plain; charset=utf-8",
+            "Not Found".to_string(),
+        ));
+    }
+    Ok(match state.fetch_metrics().await {
+        Ok(metrics) => text_response(StatusCode::OK, METRICS_CONTENT_TYPE, metrics),
+        Err(err) => {
+            error!("Failed to fetch metrics: {}", err);
+            text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                METRICS_CONTENT_TYPE,
+                "Error retrieving metrics".to_string(),
+            )
+        }
+    })
+}
+
+async fn serve(listener: TcpListener, state: Arc<AppState>, shutdown: impl Future<Output = ()>) {
+    let graceful = GracefulShutdown::new();
+    let mut shutdown = pin!(shutdown);
+    loop {
+        let stream = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => stream,
+                Err(err) => {
+                    error!("Failed to accept connection: {}", err);
+                    continue;
+                }
+            },
+            () = &mut shutdown => break,
+        };
+        let state = state.clone();
+        let service = service_fn(move |req| handle_request(req, state.clone()));
+        let connection = http1::Builder::new().serve_connection(TokioIo::new(stream), service);
+        let connection = graceful.watch(connection);
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                debug!("Connection error: {}", err);
+            }
+        });
+    }
+    graceful.shutdown().await;
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse command-line arguments (handles --version automatically)
-    let _cli = Cli::parse();
+async fn main() -> ExitCode {
+    match cli::parse_args(std::env::args().skip(1)) {
+        cli::CliAction::Run => {}
+        cli::CliAction::Print(text) => {
+            println!("{text}");
+            return ExitCode::SUCCESS;
+        }
+        cli::CliAction::Reject(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(2);
+        }
+    }
 
     env_logger::init();
 
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Configuration from environment variables
     let web_console_url =
         std::env::var("I2PD_WEB_CONSOLE").unwrap_or_else(|_| "http://127.0.0.1:7070".to_string());
@@ -490,55 +583,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let state = Arc::new(AppState::new(web_client, web_console_url));
-
-    // Define a small async handler function for /metrics
-    async fn metrics_handler(st: Arc<AppState>) -> Result<impl warp::Reply, warp::Rejection> {
-        match st.fetch_metrics().await {
-            Ok(metrics) => {
-                let reply = warp::reply::with_status(metrics, warp::http::StatusCode::OK);
-                let reply =
-                    warp::reply::with_header(reply, "Content-Type", "text/plain; version=0.0.4");
-                Ok(reply)
-            }
-            Err(err) => {
-                error!("Failed to fetch metrics: {}", err);
-                let error_body = "Error retrieving metrics".to_string();
-                let reply = warp::reply::with_status(
-                    error_body,
-                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-                );
-                let reply =
-                    warp::reply::with_header(reply, "Content-Type", "text/plain; version=0.0.4");
-                Ok(reply)
-            }
-        }
-    }
-
-    // Warp filter for GET /metrics
-    let route_metrics = warp::path("metrics")
-        .and(warp::any().map(move || state.clone()))
-        .and_then(metrics_handler);
-
-    // Fallback 404 for anything else
-    let route_404 = warp::any()
-        .map(|| warp::reply::with_status("Not Found", warp::http::StatusCode::NOT_FOUND));
-
-    // Combine
-    let routes = route_metrics.or(route_404);
+    let listener = TcpListener::bind(listen_addr).await?;
 
     info!("Listening on http://{}", listen_addr);
 
-    let server = warp::serve(routes).bind_with_graceful_shutdown(listen_addr, async {
+    serve(listener, state, async {
         if let Err(e) = signal::ctrl_c().await {
             error!("Failed to listen for shutdown signal: {}", e);
         }
         info!("Shutdown signal received, shutting down...");
-    });
-
-    // The bind_with_graceful_shutdown function returns a tuple (SocketAddr, Future)
-    // We only need to await the future part (the second element).
-    let (_addr, future) = server;
-    future.await;
+    })
+    .await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
+
+    #[test]
+    fn metrics_path_matches_the_segment_only() {
+        assert!(is_metrics_path("/metrics"));
+        assert!(is_metrics_path("/metrics/"));
+        assert!(is_metrics_path("/metrics/extra"));
+        assert!(!is_metrics_path("/"));
+        assert!(!is_metrics_path("/metricsx"));
+        assert!(!is_metrics_path("/other"));
+    }
+
+    async fn get(addr: SocketAddr, path: &str) -> String {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!("GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn serves_not_found_and_metrics_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(AppState::new(
+            reqwest::Client::new(),
+            "http://127.0.0.1:1".to_string(),
+        ));
+        let (stop, stopped) = oneshot::channel::<()>();
+        let server = tokio::spawn(serve(listener, state, async {
+            let _ = stopped.await;
+        }));
+
+        let missing = get(addr, "/other").await;
+        assert!(missing.starts_with("HTTP/1.1 404 Not Found"), "{missing}");
+        assert!(missing.ends_with("Not Found"), "{missing}");
+
+        let failed = get(addr, "/metrics").await;
+        assert!(
+            failed.starts_with("HTTP/1.1 500 Internal Server Error"),
+            "{failed}"
+        );
+        assert!(failed.contains("content-type: text/plain; version=0.0.4"));
+        assert!(failed.ends_with("Error retrieving metrics"), "{failed}");
+
+        stop.send(()).unwrap();
+        server.await.unwrap();
+    }
 }
